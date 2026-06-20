@@ -39,7 +39,9 @@ Screen Curtain is active."""
 	# Documentation file name
 	addon_docFileName="readme.html",
 	# Minimum NVDA version supported (e.g. "2019.3.0", minor version is optional)
-	addon_minimumNVDAVersion="2024.4.0",
+	# 2026.1 introduced PrivacyAndSecuritySettingsPanel._ensureScreenCurtainEnableState, which this
+	# add-on hooks; earlier versions lack it, so 2026.1 is the true minimum.
+	addon_minimumNVDAVersion="2026.1.0",
 	# Last NVDA version supported/tested (e.g. "2024.4.0", ideally more recent than minimum version)
 	addon_lastTestedNVDAVersion="2026.1.0",
 	# Add-on update channel (default is None, denoting stable releases,

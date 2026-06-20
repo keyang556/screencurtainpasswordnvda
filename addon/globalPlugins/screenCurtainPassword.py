@@ -12,7 +12,6 @@ import os
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
-from types import MethodType
 from typing import Any
 
 import addonHandler
@@ -28,7 +27,6 @@ from gui import guiHelper, settingsDialogs
 from gui.message import displayDialogAsModal
 from gui.settingsDialogs import SettingsPanel
 from logHandler import log
-from scriptHandler import getLastScriptRepeatCount
 
 addonHandler.initTranslation()
 
@@ -343,18 +341,27 @@ def _authenticateAsync(
 	onSuccess: Callable[[], None],
 	onFailure: Callable[[], None] | None = None,
 	parent: wx.Window | None = None,
+	onClose: Callable[[], None] | None = None,
 ) -> None:
 	if not _isProtectionActive():
 		onSuccess()
+		if onClose is not None:
+			onClose()
 		return
 	parent = parent or getattr(gui, "mainFrame", None)
 	dialog = _PasswordPromptDialog(parent, actionLabel)
 
 	def onResult(result: int) -> None:
-		if result == wx.ID_OK:
-			onSuccess()
-		elif result != _PASSWORD_RESET_REQUESTED_RESULT and onFailure is not None:
-			onFailure()
+		# ``onClose`` must run for every outcome (success, failure, reset request, or cancel)
+		# so callers can reliably release state such as a re-entrancy guard.
+		try:
+			if result == wx.ID_OK:
+				onSuccess()
+			elif result != _PASSWORD_RESET_REQUESTED_RESULT and onFailure is not None:
+				onFailure()
+		finally:
+			if onClose is not None:
+				onClose()
 
 	gui.runScriptModalDialog(dialog, onResult)
 
@@ -490,23 +497,39 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		self._guardedTriggerNVDAExit: Callable[..., bool] | None = None
 		self._originalPrivacyEnsureState: Callable[..., None] | None = None
 		self._guardedPrivacyEnsureState: Callable[..., None] | None = None
-		self._screenCurtainController: Any | None = None
-		self._originalScreenCurtainDisable: Callable[..., None] | None = None
-		self._guardedScreenCurtainDisable: Callable[..., None] | None = None
-		self._screenCurtainControllerHadOwnDisable = False
+		self._authPromptOpen = False
 		self._registerSettingsPanel()
-		_resumePendingPasswordReset()
-		self._patchCoreExit()
-		self._patchPrivacyPanel()
-		self._patchScreenCurtainController()
+		config.post_configReset.register(self._onConfigReset)
+		try:
+			_resumePendingPasswordReset()
+			self._patchCoreExit()
+			self._patchPrivacyPanel()
+		except Exception:
+			# Never leave NVDA in a half-patched state: roll everything back before failing.
+			log.error("Failed to initialize Screen Curtain password protection; rolling back.", exc_info=True)
+			self._restorePatches()
+			_ = config.post_configReset.unregister(self._onConfigReset)
+			self._unregisterSettingsPanel()
+			raise
 
 	def terminate(self) -> None:
-		self._restoreScreenCurtainController()
+		try:
+			_ = config.post_configReset.unregister(self._onConfigReset)
+		except Exception:
+			log.debugWarning("Unable to unregister Screen Curtain password config reset handler.", exc_info=True)
+		self._restorePatches()
+		self._unregisterSettingsPanel()
+		super().terminate()
+
+	def _restorePatches(self) -> None:
 		self._restorePrivacyPanel()
 		self._restoreCoreExit()
 		_stopPasswordResetTimer()
-		self._unregisterSettingsPanel()
-		super().terminate()
+
+	def _onConfigReset(self, **kwargs: Any) -> None:
+		# A configuration reset (NVDA+control+r) or profile switch rebuilds config.conf,
+		# which can drop our section spec/defaults. Re-register them.
+		_ = _ensureConfig()
 
 	def _registerSettingsPanel(self) -> None:
 		if ScreenCurtainPasswordSettingsPanel not in gui.NVDASettingsDialog.categoryClasses:
@@ -519,19 +542,44 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			pass
 
 	def _patchCoreExit(self) -> None:
-		self._originalTriggerNVDAExit = core.triggerNVDAExit
+		target = core.triggerNVDAExit
+		if getattr(target, "_isScreenCurtainPasswordGuard", False):
+			# A previous guard leaked (e.g. a failed reload). Adopt its original so we never
+			# stack guards on top of each other.
+			target = getattr(target, "_screenCurtainPasswordOriginal", target)
+		self._originalTriggerNVDAExit = target
 
 		def guardedTriggerNVDAExit(*args: Any, **kwargs: Any) -> bool:
-			if _shouldProtectExit() and not _authenticate(
-				_("Enter the Screen Curtain password to exit or restart NVDA."),
-			):
-				ui.message(_("NVDA exit canceled."))
-				return False
+			newNVDA = args[0] if args else kwargs.get("newNVDA")
+			# Only protect a genuine, user-initiated plain exit. Restart/update/install pass a
+			# NewNVDAInstance and must not be blocked. Also require a live GUI main loop on the
+			# main thread so we never raise a modal during teardown (e.g. the WM_QUIT fallback).
+			app = wx.GetApp()
+			safeToPrompt = (
+				newNVDA is None
+				and not _isPasswordGuardBypassed()
+				and wx.IsMainThread()
+				and app is not None
+				and app.IsMainLoopRunning()
+				and _shouldProtectExit()
+			)
+			if safeToPrompt:
+				try:
+					authorized = _authenticate(_("Enter the Screen Curtain password to exit NVDA."))
+				except Exception:
+					# Fail open: never trap the user inside NVDA because of an internal error.
+					log.error("Screen Curtain exit authentication failed; allowing exit.", exc_info=True)
+					authorized = True
+				if not authorized:
+					ui.message(_("NVDA exit canceled."))
+					return False
 			with _bypassPasswordGuard():
 				if self._originalTriggerNVDAExit is None:
 					return False
 				return self._originalTriggerNVDAExit(*args, **kwargs)
 
+		setattr(guardedTriggerNVDAExit, "_isScreenCurtainPasswordGuard", True)
+		setattr(guardedTriggerNVDAExit, "_screenCurtainPasswordOriginal", target)
 		self._guardedTriggerNVDAExit = guardedTriggerNVDAExit
 		core.triggerNVDAExit = guardedTriggerNVDAExit
 
@@ -542,9 +590,19 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		self._originalTriggerNVDAExit = None
 
 	def _patchPrivacyPanel(self) -> None:
-		self._originalPrivacyEnsureState = (
-			settingsDialogs.PrivacyAndSecuritySettingsPanel._ensureScreenCurtainEnableState
-		)
+		panelClass = getattr(settingsDialogs, "PrivacyAndSecuritySettingsPanel", None)
+		original = getattr(panelClass, "_ensureScreenCurtainEnableState", None)
+		if panelClass is None or original is None:
+			# This NVDA build does not expose the Privacy & Security screen curtain hook.
+			# Skip this layer gracefully; the gesture guard still protects disabling.
+			log.warning(
+				"PrivacyAndSecuritySettingsPanel._ensureScreenCurtainEnableState is unavailable; "
+				+ "Screen Curtain password protection for the settings panel is disabled.",
+			)
+			return
+		if getattr(original, "_isScreenCurtainPasswordGuard", False):
+			original = getattr(original, "_screenCurtainPasswordOriginal", original)
+		self._originalPrivacyEnsureState = original
 
 		def guardedEnsureScreenCurtainEnableState(panel: Any, evt: Any) -> None:
 			try:
@@ -555,14 +613,20 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				)
 			except Exception:
 				disablingScreenCurtain = False
-			if (
-				disablingScreenCurtain
-				and not _isPasswordGuardBypassed()
-				and _shouldProtectScreenCurtainDisable()
-				and not _authenticate(
-					_("Enter the Screen Curtain password to disable Screen Curtain."), parent=panel
+			try:
+				blocked = (
+					disablingScreenCurtain
+					and not _isPasswordGuardBypassed()
+					and _shouldProtectScreenCurtainDisable()
+					and not _authenticate(
+						_("Enter the Screen Curtain password to disable Screen Curtain."), parent=panel
+					)
 				)
-			):
+			except Exception:
+				# Fail open: a faulty prompt must not break the settings panel.
+				log.error("Screen Curtain disable authentication failed in settings panel.", exc_info=True)
+				blocked = False
+			if blocked:
 				panel._screenCurtainEnabledCheckbox.SetValue(True)
 				ui.message(_("Screen Curtain remains enabled."))
 				return
@@ -571,62 +635,19 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 					return None
 				return self._originalPrivacyEnsureState(panel, evt)
 
+		setattr(guardedEnsureScreenCurtainEnableState, "_isScreenCurtainPasswordGuard", True)
+		setattr(guardedEnsureScreenCurtainEnableState, "_screenCurtainPasswordOriginal", original)
 		self._guardedPrivacyEnsureState = guardedEnsureScreenCurtainEnableState
-		settingsDialogs.PrivacyAndSecuritySettingsPanel._ensureScreenCurtainEnableState = (
-			guardedEnsureScreenCurtainEnableState
-		)
+		panelClass._ensureScreenCurtainEnableState = guardedEnsureScreenCurtainEnableState
 
 	def _restorePrivacyPanel(self) -> None:
-		currentMethod = settingsDialogs.PrivacyAndSecuritySettingsPanel._ensureScreenCurtainEnableState
-		if self._guardedPrivacyEnsureState is not None and currentMethod is self._guardedPrivacyEnsureState:
-			settingsDialogs.PrivacyAndSecuritySettingsPanel._ensureScreenCurtainEnableState = (
-				self._originalPrivacyEnsureState
-			)
+		panelClass = getattr(settingsDialogs, "PrivacyAndSecuritySettingsPanel", None)
+		if self._guardedPrivacyEnsureState is not None and panelClass is not None:
+			currentMethod = getattr(panelClass, "_ensureScreenCurtainEnableState", None)
+			if currentMethod is self._guardedPrivacyEnsureState:
+				panelClass._ensureScreenCurtainEnableState = self._originalPrivacyEnsureState
 		self._guardedPrivacyEnsureState = None
 		self._originalPrivacyEnsureState = None
-
-	def _patchScreenCurtainController(self) -> None:
-		controller = getattr(screenCurtain, "screenCurtain", None)
-		if controller is None or controller is self._screenCurtainController:
-			return
-		self._restoreScreenCurtainController()
-		self._screenCurtainController = controller
-		self._screenCurtainControllerHadOwnDisable = "disable" in getattr(controller, "__dict__", {})
-		self._originalScreenCurtainDisable = controller.disable
-
-		def guardedDisable(_controller: Any, *args: Any, **kwargs: Any) -> None:
-			if (
-				not _isPasswordGuardBypassed()
-				and _shouldProtectScreenCurtainDisable()
-				and not _authenticate(_("Enter the Screen Curtain password to disable Screen Curtain."))
-			):
-				ui.message(_("Screen Curtain remains enabled."))
-				return None
-			with _bypassPasswordGuard():
-				if self._originalScreenCurtainDisable is None:
-					return None
-				return self._originalScreenCurtainDisable(*args, **kwargs)
-
-		self._guardedScreenCurtainDisable = MethodType(guardedDisable, controller)
-		controller.disable = self._guardedScreenCurtainDisable
-
-	def _restoreScreenCurtainController(self) -> None:
-		if (
-			self._screenCurtainController is not None
-			and self._guardedScreenCurtainDisable is not None
-			and getattr(self._screenCurtainController, "disable", None) is self._guardedScreenCurtainDisable
-		):
-			if self._screenCurtainControllerHadOwnDisable:
-				self._screenCurtainController.disable = self._originalScreenCurtainDisable
-			else:
-				try:
-					del self._screenCurtainController.disable
-				except AttributeError:
-					self._screenCurtainController.disable = self._originalScreenCurtainDisable
-		self._screenCurtainController = None
-		self._originalScreenCurtainDisable = None
-		self._guardedScreenCurtainDisable = None
-		self._screenCurtainControllerHadOwnDisable = False
 
 	def _disableScreenCurtainAfterAuthentication(self) -> None:
 		controller = getattr(screenCurtain, "screenCurtain", None)
@@ -647,15 +668,33 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				log.debugWarning("Unable to cache Screen Curtain toggle message.", exc_info=True)
 			ui.message(message)
 
+	def _clearAuthPromptOpen(self) -> None:
+		self._authPromptOpen = False
+
 	def script_toggleScreenCurtain(self, gesture: Any) -> None:
-		self._patchScreenCurtainController()
-		if _shouldProtectScreenCurtainDisable() and getLastScriptRepeatCount() == 0:
-			_authenticateAsync(
-				_("Enter the Screen Curtain password to disable Screen Curtain."),
-				self._disableScreenCurtainAfterAuthentication,
-				lambda: ui.message(_("Screen Curtain remains enabled.")),
-			)
+		if _shouldProtectScreenCurtainDisable():
+			# Curtain is on and protected: every press must authenticate before disabling,
+			# regardless of repeat count. Ignore repeats while the prompt is already open so a
+			# fast double press cannot fall through to NVDA's native toggle.
+			if self._authPromptOpen:
+				return
+			try:
+				self._authPromptOpen = True
+				_authenticateAsync(
+					_("Enter the Screen Curtain password to disable Screen Curtain."),
+					self._disableScreenCurtainAfterAuthentication,
+					lambda: ui.message(_("Screen Curtain remains enabled.")),
+					onClose=self._clearAuthPromptOpen,
+				)
+			except Exception:
+				# Fail open: never let a prompt failure swallow the gesture.
+				self._authPromptOpen = False
+				log.error("Screen Curtain disable authentication failed.", exc_info=True)
+				with _bypassPasswordGuard():
+					globalCommands.commands.script_toggleScreenCurtain(gesture)
 			return
+		# Curtain is off or unprotected: delegate to NVDA, preserving its single/double press
+		# (temporary vs persistent) enable semantics.
 		with _bypassPasswordGuard():
 			globalCommands.commands.script_toggleScreenCurtain(gesture)
 
