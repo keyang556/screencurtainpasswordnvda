@@ -26,7 +26,7 @@ addon_info = AddonInfo(
 Screen Curtain is active."""
 	),
 	# version
-	addon_version="0.1.0",
+	addon_version="0.1.1",
 	# Brief changelog for this version
 	# Translators: what's new content for the add-on version to be shown in the add-on store
 	addon_changelog=_("Initial version with Screen Curtain password settings and exit protection."),
